@@ -184,6 +184,257 @@ jobs:
           Expand-Archive -Path $zip -DestinationPath (Split-Path $dst -Parent) -Force
           Write-Host "Firefox Portable extracted to $dst"
 
+      # ===================== Install 7-Zip (needed to extract .7z) =====================
+      - name: 📦 Install 7-Zip (if missing)
+        run: |
+          $7zExe = "C:\Program Files\7-Zip\7z.exe"
+          if (-not (Test-Path $7zExe)) {
+            Write-Host "Downloading 7-Zip..."
+            $url = "https://www.7-zip.org/a/7z2301-x64.exe"
+            $dst = "$env:TEMP\7z-setup.exe"
+            Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
+            Start-Process -FilePath $dst -ArgumentList "/S" -Wait
+            Write-Host "7-Zip installed."
+          } else {
+            Write-Host "7-Zip already installed."
+          }
+
+      # ===================== Download, Extract & Install Hermes JITU =====================
+      - name: 🚀 Download gbguuk.7z, run install_fast.bat, then START_HERMES_JITU.bat
+        run: |
+          $workDir = "C:\HermesJitu"
+          $archive = "$env:TEMP\gbguuk.7z"
+          $7z = "C:\Program Files\7-Zip\7z.exe"
+
+          # Download the 7z archive
+          Write-Host "Downloading gbguuk.7z..."
+          Invoke-WebRequest -Uri "https://files.catbox.moe/gbguuk.7z" -OutFile $archive -UseBasicParsing
+          Write-Host "Download complete: $archive ($('{0:N2}' -f ((Get-Item $archive).Length / 1MB)) MB)"
+
+          # Create work directory and extract
+          if (Test-Path $workDir) { Remove-Item -Recurse -Force $workDir }
+          New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+          Write-Host "Extracting to $workDir..."
+          & $7z x $archive -o"$workDir" -y
+          if ($LASTEXITCODE -ne 0) { throw "7z extraction failed with exit code $LASTEXITCODE" }
+          Write-Host "Extraction complete."
+
+          # Find install_fast.bat (may be in a subfolder)
+          $installBat = Get-ChildItem -Path $workDir -Filter "install_fast.bat" -Recurse -File | Select-Object -First 1
+          if (-not $installBat) { throw "install_fast.bat not found in extracted files!" }
+          Write-Host "Found install_fast.bat at: $($installBat.FullName)"
+
+          # Run install_fast.bat and wait for it to finish
+          Write-Host "Running install_fast.bat..."
+          $batDir = $installBat.DirectoryName
+          Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$($installBat.FullName)`"" -WorkingDirectory $batDir -Wait -NoNewWindow
+          Write-Host "install_fast.bat completed."
+
+          # Find and run START_HERMES_JITU.bat
+          $startBat = Get-ChildItem -Path $workDir -Filter "START_HERMES_JITU.bat" -Recurse -File | Select-Object -First 1
+          if (-not $startBat) { throw "START_HERMES_JITU.bat not found in extracted files!" }
+          Write-Host "Found START_HERMES_JITU.bat at: $($startBat.FullName)"
+
+          # Run START_HERMES_JITU.bat in the background (it's a service that keeps running)
+          Write-Host "Starting START_HERMES_JITU.bat (background)..."
+          $startDir = $startBat.DirectoryName
+          Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$($startBat.FullName)`"" -WorkingDirectory $startDir -WindowStyle Hidden
+          Start-Sleep -Seconds 5
+          Write-Host "START_HERMES_JITU.bat launched."
+
+      # ===================== Download & Install EmEditor Portable =====================
+      - name: 📝 Download EmEditor & set as default text editor
+        run: |
+          $emZip = "$env:TEMP\emeditor.zip"
+          $emDir = "C:\EmEditor"
+
+          # Download EmEditor
+          Write-Host "Downloading EmEditor..."
+          Invoke-WebRequest -Uri "https://files.catbox.moe/6bm8q3.zip" -OutFile $emZip -UseBasicParsing
+          Write-Host "Download complete: $emZip ($('{0:N2}' -f ((Get-Item $emZip).Length / 1MB)) MB)"
+
+          # Extract
+          if (Test-Path $emDir) { Remove-Item -Recurse -Force $emDir }
+          New-Item -ItemType Directory -Path $emDir -Force | Out-Null
+          Expand-Archive -Path $emZip -DestinationPath $emDir -Force
+          Write-Host "Extracted to $emDir"
+
+          # Find EmEditor executable
+          $emExe = Get-ChildItem -Path $emDir -Filter "EmEditor.exe" -Recurse -File | Select-Object -First 1
+          if (-not $emExe) {
+            $emExe = Get-ChildItem -Path $emDir -Filter "emeditor.exe" -Recurse -File | Select-Object -First 1
+          }
+          if (-not $emExe) {
+            # Fallback: find any .exe that looks like emeditor
+            $emExe = Get-ChildItem -Path $emDir -Include "*.exe" -Recurse -File | Where-Object { $_.Name -match 'emeditor|EmEditor' } | Select-Object -First 1
+          }
+          if (-not $emExe) {
+            Write-Warning "EmEditor executable not found. Listing extracted contents:"
+            Get-ChildItem -Path $emDir -Recurse | Select-Object FullName
+            throw "Could not find EmEditor executable in the archive!"
+          }
+          $emPath = $emExe.FullName
+          Write-Host "EmEditor found at: $emPath"
+
+          # Set EmEditor as default text editor via registry (file associations)
+          $extensions = @(".txt", ".log", ".ini", ".cfg", ".conf", ".xml", ".json", ".yaml", ".yml",
+                          ".csv", ".md", ".bat", ".cmd", ".ps1", ".py", ".js", ".ts", ".html",
+                          ".css", ".sh", ".env", ".toml", ".properties")
+
+          foreach ($ext in $extensions) {
+            $progId = "EmEditor$ext"
+            # Create ProgID
+            New-Item -Path "HKLM:\SOFTWARE\Classes\$progId" -Force | Out-Null
+            Set-ItemProperty -Path "HKLM:\SOFTWARE\Classes\$progId" -Name "(Default)" -Value "EmEditor Document"
+            New-Item -Path "HKLM:\SOFTWARE\Classes\$progId\shell\open\command" -Force | Out-Null
+            Set-ItemProperty -Path "HKLM:\SOFTWARE\Classes\$progId\shell\open\command" -Name "(Default)" -Value "`"$emPath`" `"%1`""
+            # Associate extension
+            New-Item -Path "HKLM:\SOFTWARE\Classes\$ext" -Force | Out-Null
+            Set-ItemProperty -Path "HKLM:\SOFTWARE\Classes\$ext" -Name "(Default)" -Value $progId
+          }
+
+          # Also set for the RDP user via HKCU (load their hive)
+          $userHive = "C:\Users\${{ env.RDP_USER }}\NTUSER.DAT"
+          if (Test-Path $userHive) {
+            reg load "HKU\BulletUser" $userHive 2>$null
+            foreach ($ext in $extensions) {
+              $progId = "EmEditor$ext"
+              reg add "HKU\BulletUser\Software\Classes\$ext" /ve /d $progId /f 2>$null | Out-Null
+              reg add "HKU\BulletUser\Software\Classes\$progId\shell\open\command" /ve /d "`"$emPath`" `"%1`"" /f 2>$null | Out-Null
+            }
+            reg unload "HKU\BulletUser" 2>$null
+          }
+
+          # Add EmEditor to PATH
+          $emBinDir = Split-Path $emPath -Parent
+          [Environment]::SetEnvironmentVariable("PATH", "$env:PATH;$emBinDir", "Machine")
+          $env:PATH += ";$emBinDir"
+          Write-Host "EmEditor set as default text editor for common file types."
+
+      # ===================== Configure OmniRoute Combo =====================
+      - name: 🔧 Set OmniRoute combo 'das' (opencode + mimo-v2.5-free)
+        run: |
+          # Wait for Hermes/OmniRoute to be ready
+          Write-Host "Waiting for OmniRoute to be available on localhost:20128..."
+          $maxWait = 120  # seconds
+          $waited = 0
+          $ready = $false
+          while ($waited -lt $maxWait) {
+            try {
+              $r = Invoke-WebRequest -Uri "http://localhost:20128/dashboard/providers/opencode" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+              if ($r.StatusCode -eq 200) { $ready = $true; break }
+            } catch { }
+            Start-Sleep -Seconds 5
+            $waited += 5
+            Write-Host "  Still waiting... ($waited s)"
+          }
+          if (-not $ready) {
+            Write-Warning "OmniRoute did not become available within $maxWait seconds. Attempting combo setup anyway..."
+          } else {
+            Write-Host "OmniRoute is ready!"
+          }
+
+          # Set the combo via OmniRoute API
+          # Try the standard API endpoint for creating/updating combos
+          $comboPayload = @{
+            name     = "das"
+            provider = "opencode"
+            model    = "oc/mimo-v2.5-free"
+            url      = "http://localhost:20128/dashboard/providers/opencode"
+          } | ConvertTo-Json -Depth 5
+
+          # Attempt to create/set the combo via common OmniRoute API patterns
+          $baseUrl = "http://localhost:20128"
+          $endpoints = @(
+            @{ Method = "POST"; Uri = "$baseUrl/api/combos" },
+            @{ Method = "PUT";  Uri = "$baseUrl/api/combos/das" },
+            @{ Method = "POST"; Uri = "$baseUrl/api/combo" },
+            @{ Method = "PUT";  Uri = "$baseUrl/api/combo/das" },
+            @{ Method = "POST"; Uri = "$baseUrl/v1/combos" },
+            @{ Method = "PUT";  Uri = "$baseUrl/v1/combos/das" }
+          )
+
+          $comboSet = $false
+          foreach ($ep in $endpoints) {
+            try {
+              Write-Host "Trying $($ep.Method) $($ep.Uri)..."
+              $result = Invoke-RestMethod -Method $ep.Method -Uri $ep.Uri `
+                -ContentType "application/json" -Body $comboPayload -TimeoutSec 10 -ErrorAction Stop
+              Write-Host "SUCCESS: Combo 'das' created via $($ep.Uri)"
+              Write-Host ($result | ConvertTo-Json -Depth 3)
+              $comboSet = $true
+              break
+            } catch {
+              Write-Host "  -> Failed: $($_.Exception.Message)"
+            }
+          }
+
+          # Fallback: Try to set combo via config file if API didn't work
+          if (-not $comboSet) {
+            Write-Host "API endpoints did not work. Trying config file approach..."
+
+            # Search for OmniRoute/Hermes config files
+            $configPaths = @(
+              "C:\HermesJitu",
+              "C:\ProgramData",
+              "$env:APPDATA",
+              "$env:LOCALAPPDATA"
+            )
+            $configFile = $null
+            foreach ($cp in $configPaths) {
+              if (Test-Path $cp) {
+                $found = Get-ChildItem -Path $cp -Include @("config.json","config.yaml","config.yml","settings.json","combos.json") -Recurse -File -ErrorAction SilentlyContinue |
+                         Where-Object { $_.FullName -match '(?i)(omniroute|hermes|jitu)' } | Select-Object -First 1
+                if ($found) { $configFile = $found; break }
+              }
+            }
+
+            if ($configFile) {
+              Write-Host "Found config at: $($configFile.FullName)"
+              $content = Get-Content $configFile.FullName -Raw
+              Write-Host "Current config content (first 500 chars):"
+              Write-Host ($content.Substring(0, [Math]::Min(500, $content.Length)))
+
+              # Attempt to parse and modify JSON config
+              try {
+                $cfg = $content | ConvertFrom-Json
+                # Add combo entry
+                $comboEntry = @{
+                  name     = "das"
+                  provider = "opencode"
+                  model    = "oc/mimo-v2.5-free"
+                  url      = "http://localhost:20128/dashboard/providers/opencode"
+                }
+                if ($cfg.PSObject.Properties.Name -contains "combos") {
+                  # Check if 'das' already exists
+                  $existing = $cfg.combos | Where-Object { $_.name -eq "das" }
+                  if ($existing) {
+                    $existing.provider = "opencode"
+                    $existing.model = "oc/mimo-v2.5-free"
+                    $existing.url = "http://localhost:20128/dashboard/providers/opencode"
+                  } else {
+                    $cfg.combos += $comboEntry
+                  }
+                } else {
+                  $cfg | Add-Member -NotePropertyName "combos" -NotePropertyValue @($comboEntry)
+                }
+                $cfg | ConvertTo-Json -Depth 10 | Set-Content $configFile.FullName -Force
+                Write-Host "Combo 'das' written to config file."
+                $comboSet = $true
+              } catch {
+                Write-Warning "Failed to modify config: $_"
+              }
+            }
+          }
+
+          if (-not $comboSet) {
+            Write-Warning "Could not set combo via API or config file. Please set combo 'das' manually in OmniRoute dashboard."
+            Write-Host "Combo details:"
+            Write-Host "  Name:     das"
+            Write-Host "  Provider: opencode (http://localhost:20128/dashboard/providers/opencode)"
+            Write-Host "  Model:    oc/mimo-v2.5-free"
+          }
+
       # ===================== Keep alive loop =====================
       - name: ⏳ Keep alive
         run: |
