@@ -205,6 +205,30 @@ jobs:
           $workDir = "C:\HermesJitu"
           $archive = "$env:TEMP\gbguuk.7z"
           $7z = "C:\Program Files\7-Zip\7z.exe"
+          $rdpUser = "${{ env.RDP_USER }}"
+          $rdpProfile = "C:\Users\$rdpUser"
+
+          # ── Ensure Bullettemporary profile directories exist ──
+          foreach ($d in @(
+            $rdpProfile,
+            "$rdpProfile\Desktop",
+            "$rdpProfile\Downloads",
+            "$rdpProfile\AppData\Roaming",
+            "$rdpProfile\AppData\Local",
+            "$rdpProfile\AppData\Local\Temp"
+          )) {
+            if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+          }
+
+          # ── Redirect env vars so bat scripts install to the RDP user profile ──
+          $env:USERPROFILE  = $rdpProfile
+          $env:HOMEDRIVE    = "C:"
+          $env:HOMEPATH     = "\Users\$rdpUser"
+          $env:APPDATA      = "$rdpProfile\AppData\Roaming"
+          $env:LOCALAPPDATA = "$rdpProfile\AppData\Local"
+          $env:TEMP         = "$rdpProfile\AppData\Local\Temp"
+          $env:TMP          = "$rdpProfile\AppData\Local\Temp"
+          Write-Host "Profile redirected to $rdpProfile"
 
           # Download the 7z archive
           Write-Host "Downloading gbguuk.7z..."
@@ -224,10 +248,20 @@ jobs:
           if (-not $installBat) { throw "install_fast.bat not found in extracted files!" }
           Write-Host "Found install_fast.bat at: $($installBat.FullName)"
 
-          # Run install_fast.bat and wait for it to finish
-          Write-Host "Running install_fast.bat..."
+          # ── Run install_fast.bat with "< NUL" to auto-bypass all pause commands ──
+          Write-Host "Running install_fast.bat (auto-bypass pause)..."
           $batDir = $installBat.DirectoryName
-          Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$($installBat.FullName)`"" -WorkingDirectory $batDir -Wait -NoNewWindow
+          $wrapper = "$env:TEMP\run_install_nopause.bat"
+          @"
+          @echo off
+          set USERPROFILE=$rdpProfile
+          set HOMEDRIVE=C:
+          set HOMEPATH=\Users\$rdpUser
+          set APPDATA=$rdpProfile\AppData\Roaming
+          set LOCALAPPDATA=$rdpProfile\AppData\Local
+          call "$($installBat.FullName)" < NUL
+          "@ | Set-Content $wrapper -Encoding ASCII
+          Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$wrapper`"" -WorkingDirectory $batDir -Wait -NoNewWindow
           Write-Host "install_fast.bat completed."
 
           # Find and run START_HERMES_JITU.bat
@@ -235,12 +269,44 @@ jobs:
           if (-not $startBat) { throw "START_HERMES_JITU.bat not found in extracted files!" }
           Write-Host "Found START_HERMES_JITU.bat at: $($startBat.FullName)"
 
-          # Run START_HERMES_JITU.bat in the background (it's a service that keeps running)
+          # ── Run START_HERMES_JITU.bat in background (also with profile redirect) ──
           Write-Host "Starting START_HERMES_JITU.bat (background)..."
           $startDir = $startBat.DirectoryName
-          Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$($startBat.FullName)`"" -WorkingDirectory $startDir -WindowStyle Hidden
-          Start-Sleep -Seconds 5
+          $wrapperStart = "$env:TEMP\run_hermes_start.bat"
+          @"
+          @echo off
+          set USERPROFILE=$rdpProfile
+          set HOMEDRIVE=C:
+          set HOMEPATH=\Users\$rdpUser
+          set APPDATA=$rdpProfile\AppData\Roaming
+          set LOCALAPPDATA=$rdpProfile\AppData\Local
+          call "$($startBat.FullName)" < NUL
+          "@ | Set-Content $wrapperStart -Encoding ASCII
+          Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$wrapperStart`"" -WorkingDirectory $startDir -WindowStyle Hidden
+          Start-Sleep -Seconds 10
           Write-Host "START_HERMES_JITU.bat launched."
+
+          # ── Fallback: copy any desktop items from runneradmin to Bullettemporary ──
+          $runnerDesktop = "C:\Users\runneradmin\Desktop"
+          $rdpDesktop = "$rdpProfile\Desktop"
+          if (Test-Path $runnerDesktop) {
+            $items = Get-ChildItem -Path $runnerDesktop -ErrorAction SilentlyContinue
+            if ($items) {
+              Write-Host "Copying $($items.Count) desktop items from runneradmin -> $rdpUser..."
+              Copy-Item -Path "$runnerDesktop\*" -Destination $rdpDesktop -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+          # Also copy AppData shortcuts/configs if they ended up in runneradmin
+          $runnerAppData = "C:\Users\runneradmin\AppData"
+          $rdpAppData = "$rdpProfile\AppData"
+          if (Test-Path "$runnerAppData\Roaming\hermes*") {
+            Copy-Item -Path "$runnerAppData\Roaming\hermes*" -Destination "$rdpAppData\Roaming\" -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          if (Test-Path "$runnerAppData\Local\hermes*") {
+            Copy-Item -Path "$runnerAppData\Local\hermes*" -Destination "$rdpAppData\Local\" -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host "Desktop & profile sync complete."
 
       # ===================== Download & Install EmEditor Portable =====================
       - name: 📝 Download EmEditor & set as default text editor
