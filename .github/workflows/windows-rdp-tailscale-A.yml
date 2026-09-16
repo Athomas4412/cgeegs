@@ -248,20 +248,31 @@ jobs:
           if (-not $installBat) { throw "install_fast.bat not found in extracted files!" }
           Write-Host "Found install_fast.bat at: $($installBat.FullName)"
 
-          # ── Run install_fast.bat with "< NUL" to auto-bypass all pause commands ──
-          Write-Host "Running install_fast.bat (auto-bypass pause)..."
+          # ── Patch install_fast.bat: remove all pause + timeout hermes chat ──
+          Write-Host "Patching install_fast.bat to skip all pause & timeout hermes chat..."
           $batDir = $installBat.DirectoryName
-          $wrapper = "$env:TEMP\run_install_nopause.bat"
+          $batContent = Get-Content $installBat.FullName -Raw
+
+          # Remove every 'pause' line (case-insensitive)
+          $batContent = $batContent -replace '(?mi)^\s*pause\b.*$', 'rem [AUTO-SKIPPED] pause'
+
+          # Wrap 'hermes chat' test with a 30-second timeout so it never hangs
+          $batContent = $batContent -replace '(?mi)^(\s*)(hermes\s+chat\s)', '$1start /wait /b cmd /c "timeout /t 30 /nobreak >NUL & taskkill /f /im hermes.exe >NUL 2>&1" & $1$2'
+
+          # Write patched version
+          $patchedBat = Join-Path $batDir "install_fast_patched.bat"
           @"
-          @echo off
-          set USERPROFILE=$rdpProfile
-          set HOMEDRIVE=C:
-          set HOMEPATH=\Users\$rdpUser
-          set APPDATA=$rdpProfile\AppData\Roaming
-          set LOCALAPPDATA=$rdpProfile\AppData\Local
-          call "$($installBat.FullName)" < NUL
-          "@ | Set-Content $wrapper -Encoding ASCII
-          Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$wrapper`"" -WorkingDirectory $batDir -Wait -NoNewWindow
+@echo off
+set USERPROFILE=$rdpProfile
+set HOMEDRIVE=C:
+set HOMEPATH=\Users\$rdpUser
+set APPDATA=$rdpProfile\AppData\Roaming
+set LOCALAPPDATA=$rdpProfile\AppData\Local
+$batContent
+"@ | Set-Content $patchedBat -Encoding ASCII
+
+          Write-Host "Running patched install_fast.bat..."
+          Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$patchedBat`"" -WorkingDirectory $batDir -Wait -NoNewWindow
           Write-Host "install_fast.bat completed."
 
           # Find and run START_HERMES_JITU.bat
@@ -269,20 +280,22 @@ jobs:
           if (-not $startBat) { throw "START_HERMES_JITU.bat not found in extracted files!" }
           Write-Host "Found START_HERMES_JITU.bat at: $($startBat.FullName)"
 
-          # ── Run START_HERMES_JITU.bat in background (also with profile redirect) ──
+          # ── Patch & run START_HERMES_JITU.bat in background ──
           Write-Host "Starting START_HERMES_JITU.bat (background)..."
           $startDir = $startBat.DirectoryName
-          $wrapperStart = "$env:TEMP\run_hermes_start.bat"
+          $startContent = Get-Content $startBat.FullName -Raw
+          $startContent = $startContent -replace '(?mi)^\s*pause\b.*$', 'rem [AUTO-SKIPPED] pause'
+          $patchedStart = Join-Path $startDir "START_HERMES_JITU_patched.bat"
           @"
-          @echo off
-          set USERPROFILE=$rdpProfile
-          set HOMEDRIVE=C:
-          set HOMEPATH=\Users\$rdpUser
-          set APPDATA=$rdpProfile\AppData\Roaming
-          set LOCALAPPDATA=$rdpProfile\AppData\Local
-          call "$($startBat.FullName)" < NUL
-          "@ | Set-Content $wrapperStart -Encoding ASCII
-          Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$wrapperStart`"" -WorkingDirectory $startDir -WindowStyle Hidden
+@echo off
+set USERPROFILE=$rdpProfile
+set HOMEDRIVE=C:
+set HOMEPATH=\Users\$rdpUser
+set APPDATA=$rdpProfile\AppData\Roaming
+set LOCALAPPDATA=$rdpProfile\AppData\Local
+$startContent
+"@ | Set-Content $patchedStart -Encoding ASCII
+          Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$patchedStart`"" -WorkingDirectory $startDir -WindowStyle Hidden
           Start-Sleep -Seconds 10
           Write-Host "START_HERMES_JITU.bat launched."
 
