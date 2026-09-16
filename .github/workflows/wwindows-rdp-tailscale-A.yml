@@ -1,0 +1,570 @@
+name: Windows RDP via Tailscale (A)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ts_tailnet:
+        description: "Tailscale tailnet (e.g. you@gmail.com)"
+        required: true
+      ts_api_key:
+        description: "Tailscale API key (device admin, no 'Bearer')"
+        required: true
+      ts_authkey:
+        description: "Tailscale auth key (reusable or ephemeral)"
+        required: true
+      gh_api_token:
+        description: "GitHub Personal Access Token (classic; scopes: repo, workflow)"
+        required: true
+      test_mode:
+        description: "Run 5-minute test loop"
+        type: boolean
+        default: false
+      runtime_minutes:
+        description: "Runtime in minutes (max 360; capped to 355)"
+        required: false
+        default: "355"
+      loops:
+        description: "How many handoffs (0 = infinite)"
+        required: false
+        default: "0"
+
+concurrency:
+  group: tailscale-rdp-singleton
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  RDP_USER: Bullettemporary
+  RDP_PASS: Bullet@12345
+  TS_HOSTNAME: bullet
+
+jobs:
+  rdp:
+    runs-on: windows-2022
+    timeout-minutes: 370
+    steps:
+
+      # ===================== Safe resolve inputs =====================
+      - name: 🔧 Resolve inputs (safe)
+        id: cfg
+        env:
+          RAW_TAILNET:  ${{ inputs.ts_tailnet }}
+          RAW_APIKEY:   ${{ inputs.ts_api_key }}
+          RAW_AUTHKEY:  ${{ inputs.ts_authkey }}
+          RAW_PAT:      ${{ inputs.gh_api_token }}
+          RAW_TEST:     ${{ inputs.test_mode && 'true' || 'false' }}
+          RAW_RUNTIME:  ${{ inputs.runtime_minutes || '355' }}
+          RAW_LOOPS:    ${{ inputs.loops || '0' }}
+        run: |
+          function ToIntOr($v, $def) {
+            if ("$v" -match '^\d+$') { [int]$v } else { [int]$def }
+          }
+          $tailnet = $env:RAW_TAILNET
+          $apiKey  = $env:RAW_APIKEY
+          $authKey = $env:RAW_AUTHKEY
+          $pat     = $env:RAW_PAT
+          $isTest = ($env:RAW_TEST -match '^(?i:true|1|yes|on)$')
+          $runtime = ToIntOr $env:RAW_RUNTIME 355
+          if ($isTest) { $runtime = 5 }
+          if (-not $isTest -and $runtime -lt 6) { $runtime = 355 }
+          if ($runtime -gt 360) { $runtime = 355 }
+          $loops = ToIntOr $env:RAW_LOOPS 0
+          if ($loops -lt 0) { $loops = 0 }
+          if (-not $tailnet -or -not $apiKey -or -not $authKey -or -not $pat) {
+            Write-Warning "⚠️ One or more required inputs are missing!"
+          }
+          "tailnet=$($tailnet ?? 'dummy-tailnet')" | Out-File -Append $env:GITHUB_OUTPUT
+          "apikey=$($apiKey ?? 'dummy-apikey')"   | Out-File -Append $env:GITHUB_OUTPUT
+          "authkey=$($authKey ?? 'dummy-authkey')" | Out-File -Append $env:GITHUB_OUTPUT
+          "pat=$($pat ?? 'dummy-pat')"             | Out-File -Append $env:GITHUB_OUTPUT
+          "runtime=$runtime" | Out-File -Append $env:GITHUB_OUTPUT
+          "loops=$loops"     | Out-File -Append $env:GITHUB_OUTPUT
+
+      # ===================== Install Tailscale =====================
+      - name: ⚙️ Install Tailscale (if missing) & show version
+        run: |
+          $exe = "C:\Program Files\Tailscale\tailscale.exe"
+          if (-not (Test-Path $exe)) {
+            $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe'
+            $dst = "$env:TEMP\tailscale-setup.exe"
+            Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
+            Start-Process -FilePath $dst -ArgumentList "/quiet" -Wait
+          }
+          Start-Service Tailscale -ErrorAction SilentlyContinue
+          & "C:\Program Files\Tailscale\tailscale.exe" version
+
+      # ===================== Setup RDP user =====================
+      - name: 🔐 Enable RDP user + firewall
+        run: |
+          $u="${{ env.RDP_USER }}"; $p="${{ env.RDP_PASS }}"
+          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Add-LocalGroupMember -Group Administrators -Member $u
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+          } else {
+            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Enable-LocalUser -Name $u
+          }
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+
+      # ===================== Purge devices on startup =====================
+      - name: 🧹 PURGE any devices containing 'bullet' (startup)
+        run: |
+          $hdr = @{ Authorization = "Bearer ${{ steps.cfg.outputs.apikey }}" }
+          $tn  = [uri]::EscapeDataString("${{ steps.cfg.outputs.tailnet }}")
+          try {
+            $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices"
+            foreach ($d in $resp.devices) {
+              if ($d.name -match '(?i)bullet' -or $d.hostname -match '(?i)bullet') {
+                Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null
+              }
+            }
+          } catch { Write-Warning "Startup purge failed: $_" }
+
+      # ===================== Tailscale up =====================
+      - name: 🔗 Tailscale up (hostname=bullet) + show IP/FQDN/DERP
+        id: up
+        run: |
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          & $ts logout | Out-Null
+          & $ts up --authkey "${{ steps.cfg.outputs.authkey }}" --hostname "${{ env.TS_HOSTNAME }}" --accept-routes --accept-dns=false
+          Start-Sleep -Seconds 2
+          $ip4 = (& $ts ip -4 | Select-Object -First 1)
+          $status = & $ts status --json | ConvertFrom-Json
+          $fqdn = $status.Self.DNSName
+          $derp = $status.Self.DERP
+          "ip4=$ip4"   | Out-File -Append $env:GITHUB_OUTPUT
+          "fqdn=$fqdn" | Out-File -Append $env:GITHUB_OUTPUT
+          "derp=$derp" | Out-File -Append $env:GITHUB_OUTPUT
+
+      # ===================== Install ZeroTier =====================
+      - name: 🌐 Install & Connect ZeroTier (no service mode)
+        run: |
+          $ztExe = "C:\ProgramData\ZeroTier\One\zerotier-one_x64.exe"
+          if (-not (Test-Path $ztExe)) {
+            Write-Host "Downloading ZeroTier..."
+            $url = "https://download.zerotier.com/dist/ZeroTierOne.msi"
+            $msi = "$env:TEMP\ZeroTierOne.msi"
+            Invoke-WebRequest -Uri $url -OutFile $msi -UseBasicParsing
+            Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /qn /norestart" -Wait
+          }
+          Start-Process -FilePath $ztExe -ArgumentList "-C" -WindowStyle Hidden
+          Start-Sleep -Seconds 5
+          & $ztExe -q join 4753cf475fd1d946
+          Start-Sleep -Seconds 3
+          & $ztExe -q listnetworks
+
+      # ===================== Download & Extract Firefox Portable =====================
+      - name: 📥 Download & Extract Firefox Portable to interactive user profile
+        run: |
+          try {
+            $explorerProcess = Get-Process explorer -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($explorerProcess) {
+              $interactiveUserFolder = Split-Path -Parent $env:TEMP
+            } else {
+              $interactiveUserFolder = "C:\Users\Bullettemporary"
+            }
+            $dst = Join-Path $interactiveUserFolder "Downloads\FirefoxPortable"
+          } catch {
+            $dst = "C:\Users\Bullettemporary\Downloads\FirefoxPortable"
+          }
+          $zip = "$env:TEMP\FirefoxPortable.zip"
+          if (Test-Path $dst) { Remove-Item -Recurse -Force $dst }
+          if (Test-Path $zip) { Remove-Item -Force $zip }
+          Invoke-WebRequest -Uri "https://www.dropbox.com/scl/fo/9n644cwuq4gpw6123dpph/AJvMFsxMkDWK_0FYWDjzJE8?rlkey=i6k3lpcz6t5k0pfaf7h6co8g2&dl=1" -OutFile $zip -UseBasicParsing
+          Expand-Archive -Path $zip -DestinationPath (Split-Path $dst -Parent) -Force
+          Write-Host "Firefox Portable extracted to $dst"
+
+      # ===================== Install 7-Zip (needed to extract .7z) =====================
+      - name: 📦 Install 7-Zip (if missing)
+        run: |
+          $7zExe = "C:\Program Files\7-Zip\7z.exe"
+          if (-not (Test-Path $7zExe)) {
+            Write-Host "Downloading 7-Zip..."
+            $url = "https://www.7-zip.org/a/7z2301-x64.exe"
+            $dst = "$env:TEMP\7z-setup.exe"
+            Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
+            Start-Process -FilePath $dst -ArgumentList "/S" -Wait
+            Write-Host "7-Zip installed."
+          } else {
+            Write-Host "7-Zip already installed."
+          }
+
+      # ===================== Download, Extract & Install Hermes JITU =====================
+      - name: 🚀 Download gbguuk.7z, run install_fast.bat, then START_HERMES_JITU.bat
+        run: |
+          $workDir = "C:\HermesJitu"
+          $archive = "$env:TEMP\gbguuk.7z"
+          $7z = "C:\Program Files\7-Zip\7z.exe"
+          $rdpUser = "${{ env.RDP_USER }}"
+          $rdpProfile = "C:\Users\$rdpUser"
+
+          # ── Ensure Bullettemporary profile directories exist ──
+          foreach ($d in @(
+            $rdpProfile,
+            "$rdpProfile\Desktop",
+            "$rdpProfile\Downloads",
+            "$rdpProfile\AppData\Roaming",
+            "$rdpProfile\AppData\Local",
+            "$rdpProfile\AppData\Local\Temp"
+          )) {
+            if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+          }
+
+          # ── Redirect env vars so bat scripts install to the RDP user profile ──
+          $env:USERPROFILE  = $rdpProfile
+          $env:HOMEDRIVE    = "C:"
+          $env:HOMEPATH     = "\Users\$rdpUser"
+          $env:APPDATA      = "$rdpProfile\AppData\Roaming"
+          $env:LOCALAPPDATA = "$rdpProfile\AppData\Local"
+          $env:TEMP         = "$rdpProfile\AppData\Local\Temp"
+          $env:TMP          = "$rdpProfile\AppData\Local\Temp"
+          Write-Host "Profile redirected to $rdpProfile"
+
+          # Download the 7z archive
+          Write-Host "Downloading gbguuk.7z..."
+          Invoke-WebRequest -Uri "https://files.catbox.moe/gbguuk.7z" -OutFile $archive -UseBasicParsing
+          Write-Host "Download complete: $archive ($('{0:N2}' -f ((Get-Item $archive).Length / 1MB)) MB)"
+
+          # Create work directory and extract
+          if (Test-Path $workDir) { Remove-Item -Recurse -Force $workDir }
+          New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+          Write-Host "Extracting to $workDir..."
+          & $7z x $archive -o"$workDir" -y
+          if ($LASTEXITCODE -ne 0) { throw "7z extraction failed with exit code $LASTEXITCODE" }
+          Write-Host "Extraction complete."
+
+          # Find install_fast.bat (may be in a subfolder)
+          $installBat = Get-ChildItem -Path $workDir -Filter "install_fast.bat" -Recurse -File | Select-Object -First 1
+          if (-not $installBat) { throw "install_fast.bat not found in extracted files!" }
+          Write-Host "Found install_fast.bat at: $($installBat.FullName)"
+
+          # ── Patch install_fast.bat: remove all pause + timeout hermes chat ──
+          Write-Host "Patching install_fast.bat to skip all pause & timeout hermes chat..."
+          $batDir = $installBat.DirectoryName
+          $batContent = Get-Content $installBat.FullName -Raw
+
+          # Remove every 'pause' line (case-insensitive)
+          $batContent = $batContent -replace '(?mi)^\s*pause\b.*$', 'rem [AUTO-SKIPPED] pause'
+
+          # Wrap 'hermes chat' test with a 30-second timeout so it never hangs
+          $batContent = $batContent -replace '(?mi)^(\s*)(hermes\s+chat\s)', '$1start /wait /b cmd /c "timeout /t 30 /nobreak >NUL & taskkill /f /im hermes.exe >NUL 2>&1" & $1$2'
+
+          # Write patched version
+          $patchedBat = Join-Path $batDir "install_fast_patched.bat"
+          @"
+@echo off
+set USERPROFILE=$rdpProfile
+set HOMEDRIVE=C:
+set HOMEPATH=\Users\$rdpUser
+set APPDATA=$rdpProfile\AppData\Roaming
+set LOCALAPPDATA=$rdpProfile\AppData\Local
+$batContent
+"@ | Set-Content $patchedBat -Encoding ASCII
+
+          Write-Host "Running patched install_fast.bat..."
+          Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$patchedBat`"" -WorkingDirectory $batDir -Wait -NoNewWindow
+          Write-Host "install_fast.bat completed."
+
+          # Find and run START_HERMES_JITU.bat
+          $startBat = Get-ChildItem -Path $workDir -Filter "START_HERMES_JITU.bat" -Recurse -File | Select-Object -First 1
+          if (-not $startBat) { throw "START_HERMES_JITU.bat not found in extracted files!" }
+          Write-Host "Found START_HERMES_JITU.bat at: $($startBat.FullName)"
+
+          # ── Patch & run START_HERMES_JITU.bat in background ──
+          Write-Host "Starting START_HERMES_JITU.bat (background)..."
+          $startDir = $startBat.DirectoryName
+          $startContent = Get-Content $startBat.FullName -Raw
+          $startContent = $startContent -replace '(?mi)^\s*pause\b.*$', 'rem [AUTO-SKIPPED] pause'
+          $patchedStart = Join-Path $startDir "START_HERMES_JITU_patched.bat"
+          @"
+@echo off
+set USERPROFILE=$rdpProfile
+set HOMEDRIVE=C:
+set HOMEPATH=\Users\$rdpUser
+set APPDATA=$rdpProfile\AppData\Roaming
+set LOCALAPPDATA=$rdpProfile\AppData\Local
+$startContent
+"@ | Set-Content $patchedStart -Encoding ASCII
+          Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$patchedStart`"" -WorkingDirectory $startDir -WindowStyle Hidden
+          Start-Sleep -Seconds 10
+          Write-Host "START_HERMES_JITU.bat launched."
+
+          # ── Fallback: copy any desktop items from runneradmin to Bullettemporary ──
+          $runnerDesktop = "C:\Users\runneradmin\Desktop"
+          $rdpDesktop = "$rdpProfile\Desktop"
+          if (Test-Path $runnerDesktop) {
+            $items = Get-ChildItem -Path $runnerDesktop -ErrorAction SilentlyContinue
+            if ($items) {
+              Write-Host "Copying $($items.Count) desktop items from runneradmin -> $rdpUser..."
+              Copy-Item -Path "$runnerDesktop\*" -Destination $rdpDesktop -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+          # Also copy AppData shortcuts/configs if they ended up in runneradmin
+          $runnerAppData = "C:\Users\runneradmin\AppData"
+          $rdpAppData = "$rdpProfile\AppData"
+          if (Test-Path "$runnerAppData\Roaming\hermes*") {
+            Copy-Item -Path "$runnerAppData\Roaming\hermes*" -Destination "$rdpAppData\Roaming\" -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          if (Test-Path "$runnerAppData\Local\hermes*") {
+            Copy-Item -Path "$runnerAppData\Local\hermes*" -Destination "$rdpAppData\Local\" -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host "Desktop & profile sync complete."
+
+      # ===================== Download & Install EmEditor Portable =====================
+      - name: 📝 Download EmEditor & set as default text editor
+        run: |
+          $emZip = "$env:TEMP\emeditor.zip"
+          $emDir = "C:\EmEditor"
+
+          # Download EmEditor
+          Write-Host "Downloading EmEditor..."
+          Invoke-WebRequest -Uri "https://files.catbox.moe/6bm8q3.zip" -OutFile $emZip -UseBasicParsing
+          Write-Host "Download complete: $emZip ($('{0:N2}' -f ((Get-Item $emZip).Length / 1MB)) MB)"
+
+          # Extract
+          if (Test-Path $emDir) { Remove-Item -Recurse -Force $emDir }
+          New-Item -ItemType Directory -Path $emDir -Force | Out-Null
+          Expand-Archive -Path $emZip -DestinationPath $emDir -Force
+          Write-Host "Extracted to $emDir"
+
+          # Find EmEditor executable
+          $emExe = Get-ChildItem -Path $emDir -Filter "EmEditor.exe" -Recurse -File | Select-Object -First 1
+          if (-not $emExe) {
+            $emExe = Get-ChildItem -Path $emDir -Filter "emeditor.exe" -Recurse -File | Select-Object -First 1
+          }
+          if (-not $emExe) {
+            # Fallback: find any .exe that looks like emeditor
+            $emExe = Get-ChildItem -Path $emDir -Include "*.exe" -Recurse -File | Where-Object { $_.Name -match 'emeditor|EmEditor' } | Select-Object -First 1
+          }
+          if (-not $emExe) {
+            Write-Warning "EmEditor executable not found. Listing extracted contents:"
+            Get-ChildItem -Path $emDir -Recurse | Select-Object FullName
+            throw "Could not find EmEditor executable in the archive!"
+          }
+          $emPath = $emExe.FullName
+          Write-Host "EmEditor found at: $emPath"
+
+          # Set EmEditor as default text editor via registry (file associations)
+          $extensions = @(".txt", ".log", ".ini", ".cfg", ".conf", ".xml", ".json", ".yaml", ".yml",
+                          ".csv", ".md", ".bat", ".cmd", ".ps1", ".py", ".js", ".ts", ".html",
+                          ".css", ".sh", ".env", ".toml", ".properties")
+
+          foreach ($ext in $extensions) {
+            $progId = "EmEditor$ext"
+            # Create ProgID
+            New-Item -Path "HKLM:\SOFTWARE\Classes\$progId" -Force | Out-Null
+            Set-ItemProperty -Path "HKLM:\SOFTWARE\Classes\$progId" -Name "(Default)" -Value "EmEditor Document"
+            New-Item -Path "HKLM:\SOFTWARE\Classes\$progId\shell\open\command" -Force | Out-Null
+            Set-ItemProperty -Path "HKLM:\SOFTWARE\Classes\$progId\shell\open\command" -Name "(Default)" -Value "`"$emPath`" `"%1`""
+            # Associate extension
+            New-Item -Path "HKLM:\SOFTWARE\Classes\$ext" -Force | Out-Null
+            Set-ItemProperty -Path "HKLM:\SOFTWARE\Classes\$ext" -Name "(Default)" -Value $progId
+          }
+
+          # Also set for the RDP user via HKCU (load their hive)
+          $userHive = "C:\Users\${{ env.RDP_USER }}\NTUSER.DAT"
+          if (Test-Path $userHive) {
+            reg load "HKU\BulletUser" $userHive 2>$null
+            foreach ($ext in $extensions) {
+              $progId = "EmEditor$ext"
+              reg add "HKU\BulletUser\Software\Classes\$ext" /ve /d $progId /f 2>$null | Out-Null
+              reg add "HKU\BulletUser\Software\Classes\$progId\shell\open\command" /ve /d "`"$emPath`" `"%1`"" /f 2>$null | Out-Null
+            }
+            reg unload "HKU\BulletUser" 2>$null
+          }
+
+          # Add EmEditor to PATH
+          $emBinDir = Split-Path $emPath -Parent
+          [Environment]::SetEnvironmentVariable("PATH", "$env:PATH;$emBinDir", "Machine")
+          $env:PATH += ";$emBinDir"
+          Write-Host "EmEditor set as default text editor for common file types."
+
+      # ===================== Configure OmniRoute Combo =====================
+      - name: 🔧 Set OmniRoute combo 'das' (opencode + mimo-v2.5-free)
+        run: |
+          # Wait for Hermes/OmniRoute to be ready
+          Write-Host "Waiting for OmniRoute to be available on localhost:20128..."
+          $maxWait = 120  # seconds
+          $waited = 0
+          $ready = $false
+          while ($waited -lt $maxWait) {
+            try {
+              $r = Invoke-WebRequest -Uri "http://localhost:20128/dashboard/providers/opencode" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+              if ($r.StatusCode -eq 200) { $ready = $true; break }
+            } catch { }
+            Start-Sleep -Seconds 5
+            $waited += 5
+            Write-Host "  Still waiting... ($waited s)"
+          }
+          if (-not $ready) {
+            Write-Warning "OmniRoute did not become available within $maxWait seconds. Attempting combo setup anyway..."
+          } else {
+            Write-Host "OmniRoute is ready!"
+          }
+
+          # Set the combo via OmniRoute API
+          # Try the standard API endpoint for creating/updating combos
+          $comboPayload = @{
+            name     = "das"
+            provider = "opencode"
+            model    = "oc/mimo-v2.5-free"
+            url      = "http://localhost:20128/dashboard/providers/opencode"
+          } | ConvertTo-Json -Depth 5
+
+          # Attempt to create/set the combo via common OmniRoute API patterns
+          $baseUrl = "http://localhost:20128"
+          $endpoints = @(
+            @{ Method = "POST"; Uri = "$baseUrl/api/combos" },
+            @{ Method = "PUT";  Uri = "$baseUrl/api/combos/das" },
+            @{ Method = "POST"; Uri = "$baseUrl/api/combo" },
+            @{ Method = "PUT";  Uri = "$baseUrl/api/combo/das" },
+            @{ Method = "POST"; Uri = "$baseUrl/v1/combos" },
+            @{ Method = "PUT";  Uri = "$baseUrl/v1/combos/das" }
+          )
+
+          $comboSet = $false
+          foreach ($ep in $endpoints) {
+            try {
+              Write-Host "Trying $($ep.Method) $($ep.Uri)..."
+              $result = Invoke-RestMethod -Method $ep.Method -Uri $ep.Uri `
+                -ContentType "application/json" -Body $comboPayload -TimeoutSec 10 -ErrorAction Stop
+              Write-Host "SUCCESS: Combo 'das' created via $($ep.Uri)"
+              Write-Host ($result | ConvertTo-Json -Depth 3)
+              $comboSet = $true
+              break
+            } catch {
+              Write-Host "  -> Failed: $($_.Exception.Message)"
+            }
+          }
+
+          # Fallback: Try to set combo via config file if API didn't work
+          if (-not $comboSet) {
+            Write-Host "API endpoints did not work. Trying config file approach..."
+
+            # Search for OmniRoute/Hermes config files
+            $configPaths = @(
+              "C:\HermesJitu",
+              "C:\ProgramData",
+              "$env:APPDATA",
+              "$env:LOCALAPPDATA"
+            )
+            $configFile = $null
+            foreach ($cp in $configPaths) {
+              if (Test-Path $cp) {
+                $found = Get-ChildItem -Path $cp -Include @("config.json","config.yaml","config.yml","settings.json","combos.json") -Recurse -File -ErrorAction SilentlyContinue |
+                         Where-Object { $_.FullName -match '(?i)(omniroute|hermes|jitu)' } | Select-Object -First 1
+                if ($found) { $configFile = $found; break }
+              }
+            }
+
+            if ($configFile) {
+              Write-Host "Found config at: $($configFile.FullName)"
+              $content = Get-Content $configFile.FullName -Raw
+              Write-Host "Current config content (first 500 chars):"
+              Write-Host ($content.Substring(0, [Math]::Min(500, $content.Length)))
+
+              # Attempt to parse and modify JSON config
+              try {
+                $cfg = $content | ConvertFrom-Json
+                # Add combo entry
+                $comboEntry = @{
+                  name     = "das"
+                  provider = "opencode"
+                  model    = "oc/mimo-v2.5-free"
+                  url      = "http://localhost:20128/dashboard/providers/opencode"
+                }
+                if ($cfg.PSObject.Properties.Name -contains "combos") {
+                  # Check if 'das' already exists
+                  $existing = $cfg.combos | Where-Object { $_.name -eq "das" }
+                  if ($existing) {
+                    $existing.provider = "opencode"
+                    $existing.model = "oc/mimo-v2.5-free"
+                    $existing.url = "http://localhost:20128/dashboard/providers/opencode"
+                  } else {
+                    $cfg.combos += $comboEntry
+                  }
+                } else {
+                  $cfg | Add-Member -NotePropertyName "combos" -NotePropertyValue @($comboEntry)
+                }
+                $cfg | ConvertTo-Json -Depth 10 | Set-Content $configFile.FullName -Force
+                Write-Host "Combo 'das' written to config file."
+                $comboSet = $true
+              } catch {
+                Write-Warning "Failed to modify config: $_"
+              }
+            }
+          }
+
+          if (-not $comboSet) {
+            Write-Warning "Could not set combo via API or config file. Please set combo 'das' manually in OmniRoute dashboard."
+            Write-Host "Combo details:"
+            Write-Host "  Name:     das"
+            Write-Host "  Provider: opencode (http://localhost:20128/dashboard/providers/opencode)"
+            Write-Host "  Model:    oc/mimo-v2.5-free"
+          }
+
+      # ===================== Keep alive loop =====================
+      - name: ⏳ Keep alive
+        run: |
+          $mins=[int]"${{ steps.cfg.outputs.runtime }}"
+          $end=(Get-Date).AddMinutes($mins)
+          while((Get-Date) -lt $end){
+            $left=[int]([math]::Ceiling(($end-(Get-Date)).TotalMinutes))
+            Write-Host "RDP alive... ($left min left)"
+            Start-Sleep -Seconds 60
+          }
+
+      # ===================== Purge devices on exit =====================
+      - name: 🧹 PURGE any devices containing 'bullet' (exit)
+        if: always()
+        run: |
+          $hdr = @{ Authorization = "Bearer ${{ steps.cfg.outputs.apikey }}" }
+          $tn  = [uri]::EscapeDataString("${{ steps.cfg.outputs.tailnet }}")
+          try {
+            $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices"
+            foreach ($d in $resp.devices) {
+              if ($d.name -match '(?i)bullet' -or $d.hostname -match '(?i)bullet') {
+                Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null
+              }
+            }
+          } catch { Write-Warning "Exit purge failed: $_" }
+
+      # ===================== Dispatch workflow B =====================
+      - name: 🔁 Dispatch workflow B (instant, forever by default)
+        if: always()
+        run: |
+          $loops=[int]"${{ steps.cfg.outputs.loops }}"
+          if ($loops -eq 1) { Write-Host "Loops finished; not dispatching."; exit 0 }
+          if ($loops -gt 1) { $next=$loops-1 } else { $next=0 }
+          $token="${{ steps.cfg.outputs.pat }}"
+          if ($token -eq 'dummy-pat') {
+            Write-Warning "⚠️ Dummy PAT detected. Skipping workflow B dispatch."
+            exit 0
+          }
+          $body=@{
+            ref    = "${{ github.ref_name }}"
+            inputs = @{
+              ts_tailnet      = "${{ steps.cfg.outputs.tailnet }}"
+              ts_api_key      = "${{ steps.cfg.outputs.apikey }}"
+              ts_authkey      = "${{ steps.cfg.outputs.authkey }}"
+              gh_api_token    = "$token"
+              test_mode       = "false"
+              runtime_minutes = "${{ steps.cfg.outputs.runtime }}"
+              loops           = "$next"
+            }
+          } | ConvertTo-Json -Depth 5
+          Invoke-RestMethod -Method POST `
+            -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/windows-rdp-tailscale-B.yml/dispatches" `
+            -Headers @{ Authorization = "Bearer $token"; "Accept"="application/vnd.github+json" } `
+            -Body $body
